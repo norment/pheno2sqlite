@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pheno2sqlite"
+version = "0.1.0"
+description = "Load Norwegian Patient Register (NPR) CSV files into an on-disk SQLite database"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "espenhgn" },
+]
+keywords = ["NPR", "SQLite", "CSV", "Norwegian health data", "register data"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: Other/Proprietary License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+
+# Runtime dependencies: NONE (uses only Python standard library)
+# The tool uses: sqlite3, csv, pathlib, argparse, logging, re, typing
+
+[project.optional-dependencies]
+# Optional: for querying the resulting database with pandas
+pandas = [
+    "pandas>=2.0",
+]
+
+# Development dependencies
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+# Everything for development + querying
+dev-full = [
+    "pandas>=2.0",
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+# CLI entry point: `pheno2sqlite` or `python -m src.main`
+pheno2sqlite = "src.main:main"
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.setuptools.package-data]
+src = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v"
