@@ -1,10 +1,22 @@
-# pheno2sqlite - NPR CSV to SQLite Database Loader
+# pheno2sqlite - NPR & KPR CSV to SQLite Database Loaders
 
-Load Norwegian Patient Register (NPR) CSV files into an on-disk SQLite database for querying.
+Load Norwegian Patient Register (NPR) and Kontroll og utbetaling av helserefusjoner (KPR) and similar CSV files into separate on-disk SQLite databases for querying.
+This tool is not aimed at replacing other tools for handling MoBa study phenotyping information such as phenotools (https://github.com/psychgen/phenotools),
+but to serve as a way to make flexible SQL database style quires within single or across multiple datasources (e.g., KPR, KUHR, LMR, MBR, NPR, SSB, mobaQ).
+The current implementation has been developed and tested on NPR and KPR data only.
 
 ## Overview
 
-This tool reads tabularized CSV files from `raw/npr/rawdata/` and loads them into a SQLite database (`db/npr.db`). The database can then be queried by other users/processes using standard SQL or pandas.
+This tool reads tabularized CSV files from Norwegian health registers and loads each data source into its **own dedicated SQLite database**:
+
+| Source | Input directory | SQLite database | Code systems |
+|--------|-----------------|-----------------|--------------|
+| **NPR** - Norwegian Patient Register (specialist care) | `raw/npr/rawdata/` | `db/npr.db` | ICD-10, NCSP, NCMP |
+| **KPR** - Kontroll og utbetaling av helserefusjoner (primary-care claims) | `raw/kpr/rawdata/` | `db/kpr.db` | ICPC-2 |
+
+Databases are **deliberately kept separate** for data-governance / ethics reasons (data are approved per user and per source) and are **never merged on disk**. An authorized user who may access both sources can still query them *together* in a single session using SQLite's `ATTACH DATABASE` (see the "Querying both sources" section below).
+
+Each database can be queried independently using standard SQL, `pandas`, or R, exactly as before.
 
 ## Installation
 
@@ -257,6 +269,176 @@ sqlite3 db/npr.db
 # Then run SQL queries:
 # SELECT * FROM somaktivitet LIMIT 10;
 # SELECT aar, COUNT(*) FROM somaktivitet GROUP BY aar;
+```
+
+## Querying both sources
+
+The NPR (`db/npr.db`) and KPR (`db/kpr.db`) databases live in **separate files** and are never merged on disk (see [Security](#security)). A user approved for *both* sources can still query them **together** in one SQLite session by **ATTACH-ing** one database onto the other. The attachment is:
+
+- **session-scoped** - it exists only for the lifetime of the connection and is never written back to disk;
+- **read-only by default** - a joint query cannot accidentally modify either source;
+- **per-user** - only a user/process that can read *both* files can attach them, so per-source approvals are respected.
+
+Inside a session the primary database is `main`; each attached database is exposed under an alias (here `kpr`). Cross-source queries join on the shared pseudonymized participant id `lopenr`.
+
+> **Performance:** cross-source joins on `lopenr` can be slow because the two databases are built independently and columns are unindexed by default. Run the loader with `--create-indexes` (or create indexes on `lopenr`/`nokkel` yourself) before running many joins.
+
+### Option A - bundled helper: `src/query.py`
+
+`src/query.py` opens one source as `main`, automatically ATTACHes every other existing source as a **read-only** companion, and runs a single SQL statement (or prints an inventory):
+
+```bash
+# Inventory of every table visible in the combined session
+python src/query.py
+
+# Count rows in an attached (KPR) table
+python src/query.py "SELECT COUNT(*) FROM kpr.regning"
+
+# Cross-source join: NPR specialist care + KPR primary-care claims
+python src/query.py "SELECT n.lopenr, r.aar AS kpr_year FROM main.somaktivitet n JOIN kpr.regning r ON n.lopenr = r.lopenr LIMIT 5"
+
+# Make KPR the primary database (NPR is then attached as 'npr')
+python src/query.py --primary kpr "SELECT COUNT(*) FROM npr.somaktivitet"
+
+# Control attachments explicitly
+python src/query.py --no-attach --attach kpr=db/kpr.db "SELECT COUNT(*) FROM kpr.diagnose"
+```
+
+### Option B - Python (`sqlite3`)
+
+```python
+import sqlite3
+
+# Open the primary database read-only and ATTACH the other source read-only
+conn = sqlite3.connect("file:db/npr.db?mode=ro", uri=True)
+conn.execute("ATTACH DATABASE 'file:db/kpr.db?mode=ro' AS kpr")
+
+# What is visible now?
+print(conn.execute("PRAGMA database_list").fetchall())
+
+# Cross-source join on the shared participant id (lopenr)
+rows = conn.execute(
+    "SELECT n.lopenr, n.aar AS npr_year, r.aar AS kpr_year "
+    "FROM main.somaktivitet n "
+    "JOIN kpr.regning r ON n.lopenr = r.lopenr LIMIT 10"
+).fetchall()
+print(rows)
+
+conn.close()
+```
+
+### Option C - pandas
+
+```python
+import sqlite3
+import pandas as pd
+
+conn = sqlite3.connect("file:db/npr.db?mode=ro", uri=True)
+conn.execute("ATTACH DATABASE 'file:db/kpr.db?mode=ro' AS kpr")
+
+df = pd.read_sql(
+    "SELECT a.lopenr, a.aar AS npr_year, r.aar AS kpr_year, "
+    "       k.kodeverdi AS icd10, d.diagnosekode AS icpc "
+    "FROM main.somaktivitet a "
+    "JOIN main.somkoder  k ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel "
+    "JOIN kpr.regning    r ON r.lopenr = a.lopenr "
+    "LEFT JOIN kpr.diagnose d ON d.lopenr = r.lopenr AND d.nokkel = r.nokkel "
+    "WHERE k.kodenavn = 'ICD-10' LIMIT 100",
+    conn,
+)
+print(df.head())
+
+conn.close()
+```
+
+### Option D - R (RSQLite)
+
+```r
+library(DBI)
+library(RSQLite)
+
+con <- dbConnect(SQLite(), "db/npr.db")
+
+# Attach the KPR database (plain path; use a 'file:...?mode=ro' URI if your
+# driver supports URI filenames for read-only access).
+dbExecute(con, "ATTACH DATABASE 'db/kpr.db' AS kpr")
+
+print(dbGetQuery(con, "PRAGMA database_list"))
+
+joined <- dbGetQuery(con, "
+    SELECT n.lopenr, n.aar AS npr_year, r.aar AS kpr_year
+    FROM main.somaktivitet n
+    JOIN kpr.regning    r ON n.lopenr = r.lopenr
+    LIMIT 10
+")
+print(joined)
+
+dbDisconnect(con)
+```
+
+### Option E - command-line `sqlite3`
+
+```bash
+sqlite3 db/npr.db
+# Inside the interactive shell:
+ATTACH DATABASE 'file:db/kpr.db?mode=ro' AS kpr;
+SELECT n.lopenr, r.aar
+FROM main.somaktivitet n
+JOIN kpr.regning r ON n.lopenr = r.lopenr
+LIMIT 5;
+```
+
+### Cross-source query examples
+
+Participants present in **both** specialist care (NPR ICD-10 `F*`) and primary care (KPR ICPC-2 `P*`):
+
+```sql
+ATTACH DATABASE 'file:db/kpr.db?mode=ro' AS kpr;
+
+SELECT DISTINCT a.lopenr
+FROM main.somkoder k
+JOIN main.somaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+WHERE k.kodenavn = 'ICD-10' AND k.kodeverdi LIKE 'F%'
+INTERSECT
+SELECT DISTINCT d.lopenr
+FROM kpr.diagnose d
+WHERE d.diagnosekode LIKE 'P%';
+```
+
+Within-source KPR joins (year `aar` lives in `regning`; join `diagnose`/`takst` to it on `(lopenr, nokkel)`):
+
+```sql
+-- KPR: ICPC-2 diagnoses with the year of the claim
+SELECT r.aar, d.diagnosekode
+FROM kpr.regning r
+JOIN kpr.diagnose d ON d.lopenr = r.lopenr AND d.nokkel = r.nokkel
+LIMIT 10;
+```
+
+Combined NPR + KPR timeline for the same individuals:
+
+```sql
+ATTACH DATABASE 'file:db/kpr.db?mode=ro' AS kpr;
+
+SELECT n.lopenr, n.aar AS npr_year, k.kodeverdi AS icd10_code,
+       r.aar AS kpr_year, d.diagnosekode AS icpc2_code, t.takstkode AS tariff_code
+FROM main.somaktivitet n
+JOIN main.somkoder   k ON k.lopenr = n.lopenr AND k.nokkel = n.nokkel
+LEFT JOIN kpr.regning r ON r.lopenr = n.lopenr
+LEFT JOIN kpr.diagnose d ON d.lopenr = r.lopenr AND d.nokkel = r.nokkel
+LEFT JOIN kpr.takst   t ON t.lopenr = r.lopenr AND t.nokkel = r.nokkel
+WHERE k.kodenavn = 'ICD-10'
+LIMIT 50;
+```
+
+Count participants/contacts per source for the same individuals:
+
+```sql
+ATTACH DATABASE 'file:db/kpr.db?mode=ro' AS kpr;
+
+SELECT 'NPR' AS source, COUNT(DISTINCT lopenr) AS n_participants FROM main.somaktivitet
+UNION ALL
+SELECT 'KPR', COUNT(DISTINCT lopenr) FROM kpr.regning;
 ```
 
 ## Example SQL Queries

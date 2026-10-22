@@ -1,5 +1,6 @@
-"""SQLite database management for the NPR CSV loader."""
+"""SQLite database management for the CSV loaders (NPR, KPR, ...)."""
 import logging
+import re
 import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -20,8 +21,11 @@ class DatabaseManager:
     def _connect(self) -> sqlite3.Connection:
         """Create connection with production-ready pragmas."""
         # Use default isolation_level (None means autocommit, but we'll use
-        # explicit transactions via BEGIN/COMMIT for batch operations)
-        conn = sqlite3.connect(str(self.db_path))
+        # explicit transactions via BEGIN/COMMIT for batch operations).
+        # ``uri=True`` allows read-only ATTACH of companion databases
+        # (e.g. 'file:/path/kpr.db?mode=ro'); ordinary paths without a
+        # 'file:' prefix are still treated as plain filenames.
+        conn = sqlite3.connect(str(self.db_path), uri=True)
         for key, value in PRAGMAS.items():
             try:
                 conn.execute(f"PRAGMA {key}={value}")
@@ -149,6 +153,93 @@ class DatabaseManager:
             logger.debug(f"Created index {index_name} on {table_name}.{column_name}")
         except sqlite3.Error as e:
             logger.warning(f"Failed to create index {index_name}: {e}")
+
+    # ------------------------------------------------------------------
+    # Multi-source support (attach companion databases / inspect schemas)
+    # ------------------------------------------------------------------
+
+    def list_tables(self, schema: str = "main") -> List[str]:
+        """List user tables in the given schema ("main" or an attached alias)."""
+        schema = self._safe_identifier(schema, "schema")
+        try:
+            cursor = self.conn.execute(
+                f"SELECT name FROM {schema}.sqlite_master "
+                f"WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+                f"ORDER BY name"
+            )
+            return [row[0] for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Failed to list tables in schema {schema}: {e}")
+            return []
+
+    def get_schema(self, schema: str = "main") -> Dict[str, List[Tuple[str, str]]]:
+        """Return {table_name: [(column, type), ...]} for a schema."""
+        schema = self._safe_identifier(schema, "schema")
+        out: Dict[str, List[Tuple[str, str]]] = {}
+        for table in self.list_tables(schema):
+            try:
+                cursor = self.conn.execute(f'PRAGMA {schema}.table_info("{table}")')
+                out[table] = [(row[1], row[2]) for row in cursor.fetchall()]
+            except sqlite3.Error as e:
+                logger.warning(f"Failed to read schema for {schema}.{table}: {e}")
+        return out
+
+    @staticmethod
+    def _safe_identifier(name: str, kind: str = "identifier") -> str:
+        """Validate a SQLite identifier we intend to interpolate (schema name)."""
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name or ""):
+            raise ValueError(f"Unsafe {kind}: {name!r}")
+        return name
+
+    @staticmethod
+    def _to_uri(db_path: Path, read_only: bool = True) -> str:
+        """Build a 'file:' URI for ATTACH, optionally read-only."""
+        resolved = Path(db_path).expanduser().resolve()
+        mode = "ro" if read_only else "rw"
+        return f"file:{resolved}?mode={mode}"
+
+    def attach(
+        self,
+        db_path: Path,
+        alias: Optional[str] = None,
+        read_only: bool = True,
+    ) -> str:
+        """ATTACH a companion database for cross-source queries.
+
+        The attached database lives only in this connection's session; nothing
+        is written back or merged. Read-only by default so a joint query cannot
+        accidentally modify the companion source.
+
+        Args:
+            db_path: Path to the SQLite file to attach.
+            alias: Schema name to expose it under (default: file stem).
+            read_only: Attach with ``mode=ro`` (default) or ``mode=rw``.
+
+        Returns:
+            The schema alias used for the attached database.
+        """
+        if alias is None:
+            alias = Path(db_path).stem
+        alias = self._safe_identifier(alias, "alias")
+        uri = self._to_uri(db_path, read_only=read_only)
+        try:
+            self.conn.execute(f'ATTACH DATABASE ? AS "{alias}"', (uri,))
+            logger.info(
+                f"Attached {db_path} as '{alias}' "
+                f"({'read-only' if read_only else 'read-write'})"
+            )
+            return alias
+        except sqlite3.Error as e:
+            logger.error(f"Failed to attach {db_path} as '{alias}': {e}")
+            raise
+
+    def detach(self, alias: str) -> None:
+        """DETACH a previously attached database."""
+        alias = self._safe_identifier(alias, "alias")
+        try:
+            self.conn.execute(f'DETACH DATABASE "{alias}"')
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to detach '{alias}': {e}")
 
     def close(self) -> None:
         """Close the database connection."""

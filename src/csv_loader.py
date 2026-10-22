@@ -1,4 +1,4 @@
-"""CSV loading and schema inference for the NPR CSV to SQLite loader."""
+"""CSV loading and schema inference for the NPR/KPR CSV to SQLite loaders."""
 import csv
 import logging
 import re
@@ -7,6 +7,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 from config import (
     ALWAYS_TEXT_COLUMN_NAMES,
+    ALWAYS_TEXT_COLUMN_SUBSTRINGS,
     ALWAYS_TEXT_COLUMN_SUFFIXES,
     CHUNK_SIZE,
     DATE_PATTERN,
@@ -176,10 +177,16 @@ def is_null_value(value: str) -> bool:
 
 
 def should_force_text(column_name: str) -> bool:
-    """Check if a column should always be TEXT (e.g., code columns)."""
+    """Check if a column should always be TEXT (e.g., code columns).
+
+    ICD-10 (e.g. 'F3201') and ICPC-2 (e.g. 'P76') codes must never be coerced
+    to numbers, so any column whose name looks code-like is forced to TEXT.
+    """
     if column_name in ALWAYS_TEXT_COLUMN_NAMES:
         return True
-    return any(column_name.endswith(suffix) for suffix in ALWAYS_TEXT_COLUMN_SUFFIXES)
+    if any(column_name.endswith(suffix) for suffix in ALWAYS_TEXT_COLUMN_SUFFIXES):
+        return True
+    return any(sub in column_name for sub in ALWAYS_TEXT_COLUMN_SUBSTRINGS)
 
 
 def infer_column_type(values: List[str], column_name: str) -> str:
