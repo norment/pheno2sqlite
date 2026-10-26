@@ -11,8 +11,8 @@ This tool reads tabularized CSV files from Norwegian health registers and loads 
 
 | Source | Input directory | SQLite database | Code systems |
 |--------|-----------------|-----------------|--------------|
-| **NPR** - Norwegian Patient Register (specialist care) | `raw/npr/rawdata/` | `db/npr.db` | ICD-10, NCSP, NCMP |
-| **KPR** - Kontroll og utbetaling av helserefusjoner (primary-care claims) | `raw/kpr/rawdata/` | `db/kpr.db` | ICPC-2 |
+| **NPR** - Norwegian Patient Register (specialist care) | `raw/npr/2026-10-19/rawdata/` | `db/npr.db` | ICD-10, NCSP, NCMP |
+| **KPR** - Kontroll og utbetaling av helserefusjoner (primary-care claims) | `raw/kpr/2026-10-19/rawdata/` | `db/kpr.db` | ICPC-2 |
 
 Databases are **deliberately kept separate** for data-governance / ethics reasons (data are approved per user and per source) and are **never merged on disk**. An authorized user who may access both sources can still query them *together* in a single session using SQLite's `ATTACH DATABASE` (see the "Querying both sources" section below).
 
@@ -23,7 +23,7 @@ Each database can be queried independently using standard SQL, `pandas`, or R, e
 ### Prerequisites
 
 - **Python 3.9+** with `pip` installed
-- Access to the raw NPR CSV files (placed in `raw/npr/rawdata/`)
+- Access to the raw NPR CSV files (placed in `raw/npr/2026-10-19/rawdata/`)
 
 ### Setup
 
@@ -65,10 +65,10 @@ python -m pytest tests/ -v
 
 ### Downloading the Data
 
-The raw NPR CSV files should be placed in `raw/npr/rawdata/`. The expected files are:
+The raw NPR CSV files should be placed in `raw/npr/2026-10-19/rawdata/`. The expected files are:
 
 ```
-raw/npr/rawdata/
+raw/npr/2026-10-19/rawdata/
 ├── avtaktivitet.csv
 ├── avtkoder.csv
 ├── phbuaktivitet.csv
@@ -706,7 +706,7 @@ python -m pytest tests/ -v
 │   └── main.py            # CLI entry point
 ├── tests/
 │   └── test_csv_loader.py # Unit tests
-├── raw/npr/rawdata/       # Input CSV files
+├── raw/npr/2026-10-19/rawdata/       # Input CSV files
 └── db/npr.db              # Output database
 ```
 

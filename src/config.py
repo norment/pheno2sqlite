@@ -15,7 +15,7 @@ DB_DIR = Path("db")
 # "Querying both sources" section of the README).
 DATASETS = {
     "npr": {
-        "input_dir": Path("raw/npr/rawdata"),
+        "input_dir": Path("raw/npr/2026-10-19/rawdata"),
         "db_file": DB_DIR / "npr.db",
         "description": (
             "Norwegian Patient Register (NPR) - specialist health care "
@@ -24,7 +24,7 @@ DATASETS = {
         "code_systems": ("ICD-10", "NCSP", "NCMP"),
     },
     "kpr": {
-        "input_dir": Path("raw/kpr/rawdata"),
+        "input_dir": Path("raw/kpr/2026-10-19/rawdata"),
         "db_file": DB_DIR / "kpr.db",
         "description": (
             "Kontroll og utbetaling av helserefusjoner (KPR) - primary care "
