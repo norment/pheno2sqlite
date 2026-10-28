@@ -1,9 +1,9 @@
-# pheno2sqlite - NPR & KPR CSV to SQLite Database Loaders
+# pheno2sqlite - NPR, KPR & KUHR CSV to SQLite Database Loaders
 
-Load Norwegian Patient Register (NPR) and Kontroll og utbetaling av helserefusjoner (KPR) and similar CSV files into separate on-disk SQLite databases for querying.
+Load Norwegian Patient Register (NPR), Kontroll og utbetaling av helserefusjoner (KPR/KUHR) and similar CSV files into separate on-disk SQLite databases for querying.
 This tool is not aimed at replacing other tools for handling MoBa study phenotyping information such as phenotools (https://github.com/psychgen/phenotools),
 but to serve as a way to make flexible SQL database style quires within single or across multiple datasources (e.g., KPR, KUHR, LMR, MBR, NPR, SSB, mobaQ).
-The current implementation has been developed and tested on NPR and KPR data only.
+The current implementation has been developed and tested on NPR, KPR and KUHR data.
 
 ## Overview
 
@@ -13,8 +13,9 @@ This tool reads tabularized CSV files from Norwegian health registers and loads 
 |--------|-----------------|-----------------|--------------|
 | **NPR** - Norwegian Patient Register (specialist care) | `raw/npr/2026-10-19/rawdata/` | `db/npr.db` | ICD-10, NCSP, NCMP |
 | **KPR** - Kontroll og utbetaling av helserefusjoner (primary-care claims) | `raw/kpr/2026-10-19/rawdata/` | `db/kpr.db` | ICPC-2 |
+| **KUHR** - Kontroll og utbetaling av helserefusjoner (primary-care claims) | `raw/kuhr/2023-10-23/rawdata/` | `db/kuhr.db` | ICPC-2 |
 
-Databases are **deliberately kept separate** for data-governance / ethics reasons (data are approved per user and per source) and are **never merged on disk**. An authorized user who may access both sources can still query them *together* in a single session using SQLite's `ATTACH DATABASE` (see the "Querying both sources" section below).
+Databases are **deliberately kept separate** for data-governance / ethics reasons (data are approved per user and per source) and are **never merged on disk**. An authorized user who may access several sources can still query them *together* in a single session using SQLite's `ATTACH DATABASE` (see the "Querying multiple sources" section below).
 
 Each database can be queried independently using standard SQL, `pandas`, or R, exactly as before.
 
@@ -85,6 +86,18 @@ raw/npr/2026-10-19/rawdata/
 
 > **Note**: These files contain protected health data and are not included in the repository. Obtain them through the appropriate NPR data access process.
 
+The raw KUHR files should be placed in `raw/kuhr/2023-10-23/rawdata/` as one delimiter-separated (`.dsv`) file per delivery year:
+
+```
+raw/kuhr/2023-10-23/rawdata/
+├── 2006 Data fra KUHR 21-50907.dsv
+├── 2007 Data fra KUHR 21-50907.dsv
+├── ...
+└── 2023 Pr. 11.10.23 Data fra KUHR 21-50907.dsv
+```
+
+> **Note**: These files contain protected health data and are not included in the repository. Obtain them through the appropriate KUHR data access process.
+
 ## Data
 
 The 12 CSV files represent 6 domains of Norwegian health register data (2008 - Aug 2026):
@@ -98,12 +111,29 @@ The 12 CSV files represent 6 domains of Norwegian health register data (2008 - A
 | SOM | `somaktivitet` | `somkoder` | Somatikk (somatic care) |
 | TSB | `tsbaktivitet` | `tsbkoder` | Tverrfaglig rusbehandling (substance abuse) |
 
+### KUHR
+
+The KUHR delivery is a set of delimiter-separated (`.dsv`) files, one per year (2006 - 2023). All years share an identical schema, so they are loaded into a **single table** named `kuhr`, with the delivery year injected into an `aar` column (matching the NPR convention):
+
+| Table | Year column | Source files |
+|-------|-------------|--------------|
+| `kuhr` | `aar` | `2006 Data fra KUHR 21-50907.dsv` … `2023 Pr. 11.10.23 Data fra KUHR 21-50907.dsv` |
+
+KUHR claims carry ICPC-2 codes; code-like columns are forced to `TEXT` (see [Database Schema](#database-schema)). Re-loading a year replaces that year's rows (idempotent), and `--force` rebuilds the whole table. Note that KUHR's participant identifier column is named `pasientlopenummer` (NPR/KPR use `lopenr`), so cross-source joins match `pasientlopenummer` to `lopenr`.
+
 ## Usage
 
 ### Load all CSV files into the database
 
 ```bash
 python src/main.py --force --verbose
+```
+
+### Load a specific source (e.g. KUHR)
+
+```bash
+# KUHR: one .dsv file per year -> single 'kuhr' table with an 'aar' column
+python src/main.py --source kuhr --force --verbose
 ```
 
 ### Load specific tables
@@ -128,7 +158,7 @@ python src/main.py --dry-run --verbose
 | `--force` | Drop and recreate existing tables |
 | `--verbose` | Enable detailed debug logging |
 | `--dry-run` | Show what would be done without executing |
-| `--create-indexes` | Auto-create indexes on `*_id` and `pasientid` columns |
+| `--create-indexes` | Auto-create indexes on `*_id`, participant-id (`lopenr`/`pasientlopenummer`/`pasientid`) and year (`aar`) columns |
 
 ## Querying the Database
 
@@ -271,17 +301,17 @@ sqlite3 db/npr.db
 # SELECT aar, COUNT(*) FROM somaktivitet GROUP BY aar;
 ```
 
-## Querying both sources
+## Querying multiple sources
 
-The NPR (`db/npr.db`) and KPR (`db/kpr.db`) databases live in **separate files** and are never merged on disk (see [Security](#security)). A user approved for *both* sources can still query them **together** in one SQLite session by **ATTACH-ing** one database onto the other. The attachment is:
+The NPR (`db/npr.db`), KPR (`db/kpr.db`) and KUHR (`db/kuhr.db`) databases live in **separate files** and are never merged on disk (see [Security](#security)). A user approved for *several* sources can still query them **together** in one SQLite session by **ATTACH-ing** the other databases onto one. The attachment is:
 
 - **session-scoped** - it exists only for the lifetime of the connection and is never written back to disk;
-- **read-only by default** - a joint query cannot accidentally modify either source;
-- **per-user** - only a user/process that can read *both* files can attach them, so per-source approvals are respected.
+- **read-only by default** - a joint query cannot accidentally modify any source;
+- **per-user** - only a user/process that can read *all* the files can attach them, so per-source approvals are respected.
 
-Inside a session the primary database is `main`; each attached database is exposed under an alias (here `kpr`). Cross-source queries join on the shared pseudonymized participant id `lopenr`.
+Inside a session the primary database is `main`; each attached database is exposed under an alias (here `kpr` and `kuhr`). Cross-source queries join on the shared pseudonymized participant id — `lopenr` in NPR and KPR, and `pasientlopenummer` in KUHR. KUHR is stored as a single `kuhr` table with the delivery year in an `aar` column, so filter by year, e.g. `kuhr.kuhr WHERE aar = 2015`.
 
-> **Performance:** cross-source joins on `lopenr` can be slow because the two databases are built independently and columns are unindexed by default. Run the loader with `--create-indexes` (or create indexes on `lopenr`/`nokkel` yourself) before running many joins.
+> **Performance:** cross-source joins on `lopenr` can be slow because each database is built independently and columns are unindexed by default. Run the loader with `--create-indexes` (or create indexes on `lopenr`/`nokkel` yourself) before running many joins.
 
 ### Option A - bundled helper: `src/query.py`
 
@@ -289,19 +319,30 @@ Inside a session the primary database is `main`; each attached database is expos
 
 ```bash
 # Inventory of every table visible in the combined session
+# (main + kpr + kuhr, whichever databases exist)
 python src/query.py
 
 # Count rows in an attached (KPR) table
 python src/query.py "SELECT COUNT(*) FROM kpr.regning"
 
+# Count rows in an attached (KUHR) table for a single delivery year
+python src/query.py "SELECT COUNT(*) FROM kuhr.kuhr WHERE aar = 2015"
+
 # Cross-source join: NPR specialist care + KPR primary-care claims
 python src/query.py "SELECT n.lopenr, r.aar AS kpr_year FROM main.somaktivitet n JOIN kpr.regning r ON n.lopenr = r.lopenr LIMIT 5"
 
-# Make KPR the primary database (NPR is then attached as 'npr')
-python src/query.py --primary kpr "SELECT COUNT(*) FROM npr.somaktivitet"
+# Cross-source join: NPR specialist care + KUHR primary-care claims (slow)
+python src/query.py "SELECT n.lopenr FROM main.somaktivitet n JOIN kuhr.kuhr k ON n.lopenr = k.pasientlopenummer AND k.aar = 2015 LIMIT 2"
+
+# Three-way join across all sources (slow)
+python src/query.py "SELECT n.lopenr FROM main.somaktivitet n JOIN kpr.regning r ON n.lopenr = r.lopenr JOIN kuhr.kuhr k ON n.lopenr = k.pasientlopenummer AND k.aar = 2015 LIMIT 2"
+
+# Make KUHR the primary database (others are then attached as 'npr', 'kpr')
+python src/query.py --primary kuhr "SELECT COUNT(*) FROM npr.somaktivitet"
 
 # Control attachments explicitly
-python src/query.py --no-attach --attach kpr=db/kpr.db "SELECT COUNT(*) FROM kpr.diagnose"
+python src/query.py --no-attach --attach kpr=db/kpr.db --attach kuhr=db/kuhr.db \
+    "SELECT COUNT(*) FROM kuhr.kuhr WHERE aar = 2015"
 ```
 
 ### Option B - Python (`sqlite3`)
@@ -309,9 +350,10 @@ python src/query.py --no-attach --attach kpr=db/kpr.db "SELECT COUNT(*) FROM kpr
 ```python
 import sqlite3
 
-# Open the primary database read-only and ATTACH the other source read-only
+# Open the primary database read-only and ATTACH the other sources read-only
 conn = sqlite3.connect("file:db/npr.db?mode=ro", uri=True)
-conn.execute("ATTACH DATABASE 'file:db/kpr.db?mode=ro' AS kpr")
+conn.execute("ATTACH DATABASE 'file:db/kpr.db?mode=ro'  AS kpr")
+conn.execute("ATTACH DATABASE 'file:db/kuhr.db?mode=ro' AS kuhr")
 
 # What is visible now?
 print(conn.execute("PRAGMA database_list").fetchall())
@@ -324,6 +366,13 @@ rows = conn.execute(
 ).fetchall()
 print(rows)
 
+# Two-way join NPR + KUHR
+kuhr_rows = conn.execute(
+    "SELECT n.lopenr FROM main.somaktivitet n "
+    "JOIN kuhr.kuhr k ON n.lopenr = k.pasientlopenummer AND k.aar = 2015 LIMIT 10"
+).fetchall()
+print(kuhr_rows)
+
 conn.close()
 ```
 
@@ -334,7 +383,8 @@ import sqlite3
 import pandas as pd
 
 conn = sqlite3.connect("file:db/npr.db?mode=ro", uri=True)
-conn.execute("ATTACH DATABASE 'file:db/kpr.db?mode=ro' AS kpr")
+conn.execute("ATTACH DATABASE 'file:db/kpr.db?mode=ro'  AS kpr")
+conn.execute("ATTACH DATABASE 'file:db/kuhr.db?mode=ro' AS kuhr")
 
 df = pd.read_sql(
     "SELECT a.lopenr, a.aar AS npr_year, r.aar AS kpr_year, "
@@ -348,6 +398,14 @@ df = pd.read_sql(
 )
 print(df.head())
 
+# Bring KUHR (one year at a time) into the same frame
+kuhr = pd.read_sql(
+    "SELECT DISTINCT a.lopenr FROM main.somaktivitet a "
+    "JOIN kuhr.kuhr k ON a.lopenr = k.pasientlopenummer AND k.aar = 2015 LIMIT 100",
+    conn,
+)
+print(kuhr.head())
+
 conn.close()
 ```
 
@@ -359,9 +417,10 @@ library(RSQLite)
 
 con <- dbConnect(SQLite(), "db/npr.db")
 
-# Attach the KPR database (plain path; use a 'file:...?mode=ro' URI if your
-# driver supports URI filenames for read-only access).
-dbExecute(con, "ATTACH DATABASE 'db/kpr.db' AS kpr")
+# Attach the KPR and KUHR databases (plain paths; use a 'file:...?mode=ro' URI
+# if your driver supports URI filenames for read-only access).
+dbExecute(con, "ATTACH DATABASE 'db/kpr.db'  AS kpr")
+dbExecute(con, "ATTACH DATABASE 'db/kuhr.db' AS kuhr")
 
 print(dbGetQuery(con, "PRAGMA database_list"))
 
@@ -373,6 +432,14 @@ joined <- dbGetQuery(con, "
 ")
 print(joined)
 
+kuhr_join <- dbGetQuery(con, "
+    SELECT n.lopenr
+    FROM main.somaktivitet n
+    JOIN kuhr.kuhr k ON n.lopenr = k.pasientlopenummer AND k.aar = 2015
+    LIMIT 10
+")
+print(kuhr_join)
+
 dbDisconnect(con)
 ```
 
@@ -381,10 +448,17 @@ dbDisconnect(con)
 ```bash
 sqlite3 db/npr.db
 # Inside the interactive shell:
-ATTACH DATABASE 'file:db/kpr.db?mode=ro' AS kpr;
+ATTACH DATABASE 'file:db/kpr.db?mode=ro'  AS kpr;
+ATTACH DATABASE 'file:db/kuhr.db?mode=ro' AS kuhr;
+
 SELECT n.lopenr, r.aar
 FROM main.somaktivitet n
 JOIN kpr.regning r ON n.lopenr = r.lopenr
+LIMIT 5;
+
+SELECT n.lopenr
+FROM main.somaktivitet n
+JOIN kuhr.kuhr k ON n.lopenr = k.pasientlopenummer AND k.aar = 2015
 LIMIT 5;
 ```
 
@@ -405,6 +479,19 @@ FROM kpr.diagnose d
 WHERE d.diagnosekode LIKE 'P%';
 ```
 
+Participants appearing in **all three** sources for a given year:
+
+```sql
+ATTACH DATABASE 'file:db/kpr.db?mode=ro'  AS kpr;
+ATTACH DATABASE 'file:db/kuhr.db?mode=ro' AS kuhr;
+
+SELECT DISTINCT n.lopenr
+FROM main.somaktivitet n
+JOIN kpr.regning    r ON r.lopenr = n.lopenr
+JOIN kuhr.kuhr k ON k.pasientlopenummer = n.lopenr AND k.aar = 2015
+LIMIT 50;
+```
+
 Within-source KPR joins (year `aar` lives in `regning`; join `diagnose`/`takst` to it on `(lopenr, nokkel)`):
 
 ```sql
@@ -415,7 +502,7 @@ JOIN kpr.diagnose d ON d.lopenr = r.lopenr AND d.nokkel = r.nokkel
 LIMIT 10;
 ```
 
-Combined NPR + KPR timeline for the same individuals:
+Combined NPR + KPR + KUHR timeline for the same individuals (filter KUHR by year with `kuhr.aar`):
 
 ```sql
 ATTACH DATABASE 'file:db/kpr.db?mode=ro' AS kpr;
@@ -434,11 +521,14 @@ LIMIT 50;
 Count participants/contacts per source for the same individuals:
 
 ```sql
-ATTACH DATABASE 'file:db/kpr.db?mode=ro' AS kpr;
+ATTACH DATABASE 'file:db/kpr.db?mode=ro'  AS kpr;
+ATTACH DATABASE 'file:db/kuhr.db?mode=ro' AS kuhr;
 
-SELECT 'NPR' AS source, COUNT(DISTINCT lopenr) AS n_participants FROM main.somaktivitet
+SELECT 'NPR'  AS source, COUNT(DISTINCT lopenr) AS n_participants FROM main.somaktivitet
 UNION ALL
-SELECT 'KPR', COUNT(DISTINCT lopenr) FROM kpr.regning;
+SELECT 'KPR',  COUNT(DISTINCT lopenr) FROM kpr.regning
+UNION ALL
+SELECT 'KUHR', COUNT(DISTINCT pasientlopenummer) FROM kuhr.kuhr WHERE aar = 2015;
 ```
 
 ## Example SQL Queries
@@ -671,6 +761,7 @@ All tables use only three SQLite types: `INTEGER`, `REAL`, and `TEXT`.
 
 - **Activity tables** (`*aktivitet`): Patient activity records with columns like `lopenr` (patient ID), `nokkel` (record key), `aar` (year), and various clinical codes
 - **Codes tables** (`*koder`): Reference codes with columns like `lopenr`, `nokkel`, `kodenavn` (code system name), `kodetype`, `kodenr`, `kodeverdi` (the actual code value)
+- **KUHR table** (`kuhr`): one row per claim across all years, with the delivery year in an `aar` column and ICPC-2 code columns forced to `TEXT`
 
 ## Performance
 
@@ -707,6 +798,7 @@ python -m pytest tests/ -v
 ├── tests/
 │   └── test_csv_loader.py # Unit tests
 ├── raw/npr/2026-10-19/rawdata/       # Input CSV files
+├── raw/kuhr/2023-10-23/rawdata/      # KUHR yearly .dsv files
 └── db/npr.db              # Output database
 ```
 

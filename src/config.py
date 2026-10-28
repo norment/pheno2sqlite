@@ -1,8 +1,13 @@
-"""Configuration constants for the CSV to SQLite loaders (NPR, KPR, ...)."""
+"""Configuration constants for the CSV to SQLite loaders (NPR, KPR, KUHR, ...)."""
 from pathlib import Path
 
 # Directory paths
 DB_DIR = Path("db")
+
+# Default glob used to discover raw files inside a dataset's input_dir.
+# Individual datasets may override this via a "file_glob" key (KUHR ships one
+# delimiter-separated ".dsv" file per year).
+DEFAULT_FILE_GLOB = "*.csv"
 
 # ---------------------------------------------------------------------------
 # Dataset registry
@@ -10,9 +15,18 @@ DB_DIR = Path("db")
 # Each source ("dataset") has its own input directory and its own *dedicated*
 # SQLite file. Database files are deliberately kept separate for
 # data-governance / ethics reasons (per-user approvals). They are NOT merged.
-# An authorized user who may access both sources can query them together in a
-# single session by ATTACH-ing the other database (see src/query.py and the
-# "Querying both sources" section of the README).
+# An authorized user who may access several sources can query them together in
+# a single session by ATTACH-ing the other databases (see src/query.py and the
+# "Querying multiple sources" section of the README).
+#
+# Optional per-dataset keys:
+#   * "file_glob"    - glob pattern used to find raw files in input_dir
+#                      (default: DEFAULT_FILE_GLOB = "*.csv").
+#   * "single_table" - if True, load every file into one fixed table
+#                      ("table_name") instead of one table per file, injecting
+#                      the 4-digit year found in each filename into a
+#                      "year_column". Default False (one table per file, named
+#                      from the sanitized filename stem - NPR/KPR behaviour).
 DATASETS = {
     "npr": {
         "input_dir": Path("raw/npr/2026-10-19/rawdata"),
@@ -22,6 +36,7 @@ DATASETS = {
             "(ICD-10 / NCSP / NCMP codes)"
         ),
         "code_systems": ("ICD-10", "NCSP", "NCMP"),
+        "file_glob": "*.csv",
     },
     "kpr": {
         "input_dir": Path("raw/kpr/2026-10-19/rawdata"),
@@ -31,6 +46,25 @@ DATASETS = {
             "claims (ICPC-2 codes)"
         ),
         "code_systems": ("ICPC-2",),
+        "file_glob": "*.csv",
+    },
+    "kuhr": {
+        "input_dir": Path("raw/kuhr/2023-10-23/rawdata"),
+        "db_file": DB_DIR / "kuhr.db",
+        "description": (
+            "Kontroll og utbetaling av helserefusjoner (KUHR) - primary "
+            "health-care reimbursement claims (ICPC-2 codes)"
+        ),
+        "code_systems": ("ICPC-2",),
+        # KUHR is shipped as one delimiter-separated (.dsv) file per year,
+        # e.g. "2006 Data fra KUHR 21-50907.dsv" .. "2023 Pr. 11.10.23 ...".
+        # All years share an identical schema, so they are loaded into a single
+        # table ("kuhr") with the delivery year injected into an "aar" column
+        # (matching the NPR convention).
+        "file_glob": "*.dsv",
+        "single_table": True,
+        "table_name": "kuhr",
+        "year_column": "aar",
     },
 }
 
@@ -43,6 +77,10 @@ DB_FILE = DATASETS["npr"]["db_file"]
 # KPR aliases
 KPR_RAW_DATA_DIR = DATASETS["kpr"]["input_dir"]
 KPR_DB_FILE = DATASETS["kpr"]["db_file"]
+
+# KUHR aliases
+KUHR_RAW_DATA_DIR = DATASETS["kuhr"]["input_dir"]
+KUHR_DB_FILE = DATASETS["kuhr"]["db_file"]
 
 
 def resolve_source(source: str) -> dict:

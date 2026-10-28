@@ -10,7 +10,13 @@ SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 from config import DATASETS, resolve_source
-from csv_loader import filename_to_table_name, should_force_text
+from csv_loader import (
+    extract_year,
+    filename_to_table_name,
+    load_all_csvs,
+    should_force_text,
+    table_name_for,
+)
 from database import DatabaseManager
 from query import connect_combined, default_attachments, inventory, run_query
 
@@ -21,17 +27,24 @@ class TestDatasetRegistry(unittest.TestCase):
     def test_known_sources(self):
         self.assertIn("npr", DATASETS)
         self.assertIn("kpr", DATASETS)
+        self.assertIn("kuhr", DATASETS)
 
     def test_resolve_source(self):
         npr = resolve_source("npr")
         self.assertEqual(str(npr["db_file"]), "db/npr.db")
         kpr = resolve_source("kpr")
         self.assertEqual(str(kpr["db_file"]), "db/kpr.db")
+        kuhr = resolve_source("kuhr")
+        self.assertEqual(str(kuhr["db_file"]), "db/kuhr.db")
 
     def test_separate_db_files(self):
         self.assertNotEqual(
             str(resolve_source("npr")["db_file"]),
             str(resolve_source("kpr")["db_file"]),
+        )
+        self.assertNotEqual(
+            str(resolve_source("npr")["db_file"]),
+            str(resolve_source("kuhr")["db_file"]),
         )
 
     def test_unknown_source_raises(self):
@@ -55,6 +68,108 @@ class TestKprTableNames(unittest.TestCase):
         }
         for fname in ("diagnose.csv", "regning.csv", "takst.csv"):
             self.assertNotIn(filename_to_table_name(fname), npr_tables)
+
+
+class TestKuhrTableNames(unittest.TestCase):
+    """KUHR yearly files should all map to the single 'kuhr' table."""
+
+    def test_kuhr_files(self):
+        cfg = resolve_source("kuhr")
+        self.assertEqual(
+            table_name_for("2006 Data fra KUHR 21-50907.dsv", cfg), "kuhr"
+        )
+        self.assertEqual(
+            table_name_for("2023 Pr. 11.10.23 Data fra KUHR 21-50907.dsv", cfg),
+            "kuhr",
+        )
+
+    def test_extract_year(self):
+        self.assertEqual(extract_year("2006 Data fra KUHR 21-50907.dsv"), "2006")
+        self.assertEqual(
+            extract_year("2023 Pr. 11.10.23 Data fra KUHR 21-50907.dsv"), "2023"
+        )
+
+    def test_default_naming_unchanged(self):
+        self.assertEqual(table_name_for("diagnose.csv"), "diagnose")
+        self.assertEqual(
+            table_name_for("diagnose.csv", resolve_source("kpr")), "diagnose"
+        )
+
+
+class TestSingleTableLoading(unittest.TestCase):
+    """single_table datasets load all files into one table with a year column."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = Path(self.temp_dir) / "kuhr.db"
+        self.db = DatabaseManager(self.db_path)
+        self.data_dir = Path(self.temp_dir) / "rawdata"
+        self.data_dir.mkdir()
+        for year in (2006, 2007):
+            with open(
+                self.data_dir / f"{year} Data fra KUHR 21-50907.dsv", "w"
+            ) as f:
+                f.write("pasientlopenummer;diagnoser\n")
+                f.write(f"P{year};A00\n")
+                f.write(f"P{year + 1};B00\n")
+
+    def tearDown(self):
+        self.db.close()
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _cfg(self):
+        return {
+            "file_glob": "*.dsv",
+            "single_table": True,
+            "table_name": "kuhr",
+            "year_column": "aar",
+        }
+
+    def test_single_table_with_year_column(self):
+        results = load_all_csvs(self.data_dir, self.db, dataset_cfg=self._cfg())
+        self.assertEqual(len(results), 2)
+        self.assertEqual(self.db.list_tables("main"), ["kuhr"])
+        self.assertIn("aar", self.db.get_table_columns("kuhr"))
+
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            "SELECT aar, COUNT(*) FROM kuhr GROUP BY aar ORDER BY aar"
+        ).fetchall()
+        conn.close()
+        self.assertEqual(rows, [(2006, 2), (2007, 2)])
+
+    def test_reload_is_idempotent(self):
+        load_all_csvs(self.data_dir, self.db, dataset_cfg=self._cfg())
+        load_all_csvs(self.data_dir, self.db, dataset_cfg=self._cfg())
+        conn = sqlite3.connect(self.db_path)
+        n = conn.execute("SELECT COUNT(*) FROM kuhr").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 4)  # not 8
+
+    def test_force_rebuilds_table(self):
+        load_all_csvs(self.data_dir, self.db, dataset_cfg=self._cfg())
+        load_all_csvs(self.data_dir, self.db, force=True, dataset_cfg=self._cfg())
+        conn = sqlite3.connect(self.db_path)
+        n = conn.execute("SELECT COUNT(*) FROM kuhr").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 4)
+
+    def test_create_indexes_on_participant_and_year(self):
+        load_all_csvs(
+            self.data_dir, self.db, create_indexes=True, dataset_cfg=self._cfg()
+        )
+        conn = sqlite3.connect(self.db_path)
+        indexes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='index' AND tbl_name='kuhr'"
+            )
+        }
+        conn.close()
+        self.assertIn("idx_kuhr_pasientlopenummer", indexes)
+        self.assertIn("idx_kuhr_aar", indexes)
 
 
 class TestCodeColumnDetection(unittest.TestCase):

@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from config import DATASETS, DEFAULT_SOURCE, resolve_source
+from config import DATASETS, DEFAULT_FILE_GLOB, DEFAULT_SOURCE, resolve_source
 from csv_loader import load_all_csvs
 from database import DatabaseManager
 
@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
             "Examples:\n"
             "  python src/main.py --source npr --force --verbose\n"
             "  python src/main.py --source kpr --force --verbose\n"
+            "  python src/main.py --source kuhr --force --verbose\n"
             "  python src/main.py --source all --force --verbose\n"
             "  python src/main.py --source kpr --show-schema\n"
             "  python src/main.py --input-dir raw/kpr/rawdata --output-db db/kpr.db --force"
@@ -86,7 +87,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--create-indexes",
         action="store_true",
-        help="Auto-create indexes on *_id and pasientid columns",
+        help=(
+            "Auto-create indexes on *_id, participant-id (lopenr/"
+            "pasientlopenummer/pasientid) and year (aar) columns"
+        ),
     )
     parser.add_argument(
         "--show-schema",
@@ -178,17 +182,28 @@ def load_one(
         logger.error(f"Input directory does not exist: {input_dir}")
         return 1
 
+    cfg = resolve_source(source)
+
     # Dry run - just show what would happen
     if args.dry_run:
-        from csv_loader import discover_csv_files, filename_to_table_name
+        from csv_loader import discover_csv_files, extract_year, table_name_for
 
-        files = discover_csv_files(input_dir)
+        file_glob = cfg.get("file_glob", DEFAULT_FILE_GLOB)
+        year_column = cfg.get("year_column") if cfg.get("single_table") else None
+        files = discover_csv_files(input_dir, file_glob)
         logger.info(f"DRY RUN [{source}] - would load the following files:")
         for filepath in files:
-            table_name = filename_to_table_name(filepath.name)
+            table_name = table_name_for(filepath.name, cfg)
             if tables_filter and table_name not in tables_filter:
                 continue
-            logger.info(f"  {filepath.name} -> table '{table_name}'")
+            if year_column:
+                year = extract_year(filepath.name)
+                logger.info(
+                    f"  {filepath.name} -> table '{table_name}' "
+                    f"({year_column}={year})"
+                )
+            else:
+                logger.info(f"  {filepath.name} -> table '{table_name}'")
         logger.info(f"  Output database: {output_db}")
         logger.info(f"  Force mode: {args.force}")
         logger.info(f"  Create indexes: {args.create_indexes}")
@@ -203,7 +218,7 @@ def load_one(
         return 1
 
     try:
-        # Load all CSVs
+        # Load all raw files
         results = load_all_csvs(
             input_dir,
             db,
@@ -211,6 +226,7 @@ def load_one(
             verbose=args.verbose,
             create_indexes=args.create_indexes,
             tables_filter=tables_filter,
+            dataset_cfg=cfg,
         )
 
         # Print summary

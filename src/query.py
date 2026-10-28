@@ -1,13 +1,17 @@
 """Ad-hoc cross-source querying for separately-stored SQLite databases.
 
-The NPR (``db/npr.db``) and KPR (``db/kpr.db``) databases are deliberately kept
-in *separate files* for data-governance / ethics reasons (data are approved
-per-user and per-source). They are never merged on disk.
+The NPR (``db/npr.db``), KPR (``db/kpr.db``) and KUHR (``db/kuhr.db``)
+databases are deliberately kept in *separate files* for data-governance /
+ethics reasons (data are approved per-user and per-source). They are never
+merged on disk.
 
-A user who is approved for both sources can still query them *together* in a
-single SQLite session by ATTACH-ing one database onto another. The attachment
-is session-scoped and read-only by default, so nothing is merged or written
-back to disk.
+A user who is approved for several sources can still query them *together* in
+a single SQLite session by ATTACH-ing one database onto another. The
+attachment is session-scoped and read-only by default, so nothing is merged or
+written back to disk.
+
+KUHR is stored as a single ``kuhr`` table with the delivery year in an
+``aar`` column.
 
 Examples
 --------
@@ -15,16 +19,20 @@ Inventory of everything visible in the combined session::
 
     python src/query.py
 
-Run a query that joins NPR and KPR data::
+Run a query that joins NPR, KPR and KUHR data::
 
     python src/query.py "SELECT COUNT(*) FROM main.somaktivitet"
     python src/query.py "SELECT n.lopenr, k.* FROM main.somaktivitet n \
         JOIN kpr.diagnose k ON n.lopenr = k.lopenr LIMIT 10"
+    python src/query.py "SELECT n.lopenr FROM main.somaktivitet n \
+        JOIN kuhr.kuhr k ON n.lopenr = k.lopenr AND k.aar = 2015 LIMIT 10"
 
 Programmatic use::
 
     from query import connect_combined
-    conn, attached = connect_combined("db/npr.db", {"kpr": "db/kpr.db"})
+    conn, attached = connect_combined(
+        "db/npr.db", {"kpr": "db/kpr.db", "kuhr": "db/kuhr.db"}
+    )
 """
 import argparse
 import logging
@@ -174,7 +182,9 @@ def parse_args() -> argparse.Namespace:
             "Examples:\n"
             "  python src/query.py\n"
             "  python src/query.py \"SELECT COUNT(*) FROM main.somaktivitet\"\n"
-            "  python src/query.py --primary npr --attach kpr=db/kpr.db \\\n"
+            "  python src/query.py \"SELECT COUNT(*) FROM kuhr.kuhr WHERE aar = 2015\"\n"
+            "  python src/query.py --primary npr \\\n"
+            "      --attach kpr=db/kpr.db --attach kuhr=db/kuhr.db \\\n"
             "      \"SELECT * FROM main.somaktivitet s JOIN kpr.diagnose d \"\n"
             "      \"ON s.lopenr = d.lopenr LIMIT 5\""
         ),

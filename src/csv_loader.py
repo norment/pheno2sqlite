@@ -1,4 +1,4 @@
-"""CSV loading and schema inference for the NPR/KPR CSV to SQLite loaders."""
+"""CSV loading and schema inference for the NPR/KPR/KUHR loaders."""
 import csv
 import logging
 import re
@@ -11,6 +11,7 @@ from config import (
     ALWAYS_TEXT_COLUMN_SUFFIXES,
     CHUNK_SIZE,
     DATE_PATTERN,
+    DEFAULT_FILE_GLOB,
     ENCODING_ORDER,
     INTEGER_PATTERN,
     MALFORMED_ROW_WARN_LIMIT,
@@ -43,14 +44,20 @@ class LoadResult:
         )
 
 
-def discover_csv_files(data_dir: Path) -> List[Path]:
-    """Find all .csv files in the directory, sorted alphabetically."""
+def discover_csv_files(
+    data_dir: Path, file_glob: str = DEFAULT_FILE_GLOB
+) -> List[Path]:
+    """Find all raw files matching ``file_glob`` in the directory, sorted.
+
+    ``file_glob`` defaults to ``*.csv``; datasets that ship other extensions
+    (e.g. KUHR's ``*.dsv``) pass their own pattern via their DATASETS entry.
+    """
     if not data_dir.exists():
         logger.error(f"Data directory does not exist: {data_dir}")
         return []
 
-    files = sorted(data_dir.glob("*.csv"))
-    logger.info(f"Found {len(files)} CSV files in {data_dir}")
+    files = sorted(data_dir.glob(file_glob))
+    logger.info(f"Found {len(files)} file(s) matching '{file_glob}' in {data_dir}")
     return files
 
 
@@ -169,6 +176,25 @@ def filename_to_table_name(filename: str) -> str:
     name = re.sub(r"_+", "_", name).strip("_")
 
     return name
+
+
+def extract_year(filename: str) -> Optional[str]:
+    """Return the first 4-digit year (19xx/20xx) in a filename, if any."""
+    match = re.search(r"(?:19|20)\d{2}", Path(filename).stem)
+    return match.group(0) if match else None
+
+
+def table_name_for(filename: str, cfg: Optional[dict] = None) -> str:
+    """Return the SQLite table name for a raw file of a dataset.
+
+    Datasets can drive naming from config:
+      * ``single_table`` -> a fixed ``table_name`` for every file (the delivery
+        year is injected into a ``year_column`` instead of splitting tables);
+      * otherwise the sanitized filename stem (existing NPR/KPR behaviour).
+    """
+    if cfg and cfg.get("single_table"):
+        return cfg.get("table_name") or filename_to_table_name(filename)
+    return filename_to_table_name(filename)
 
 
 def is_null_value(value: str) -> bool:
@@ -306,6 +332,10 @@ def load_csv_to_db(
     force: bool = False,
     verbose: bool = False,
     create_indexes: bool = False,
+    table_name: Optional[str] = None,
+    year: Optional[int] = None,
+    year_column: Optional[str] = None,
+    replace_year: bool = False,
 ) -> LoadResult:
     """
     Load a single CSV file into the database.
@@ -316,11 +346,17 @@ def load_csv_to_db(
         force: Drop existing table before loading
         verbose: Enable detailed logging
         create_indexes: Auto-create indexes on *_id columns
+        table_name: Explicit table name (defaults to filename_to_table_name)
+        year: Delivery year to inject (used together with ``year_column``)
+        year_column: Name of an extra INTEGER column holding ``year``; when set,
+            every row gets the year appended (single-table mode)
+        replace_year: Delete existing rows for ``year`` before inserting, so
+            re-loading a year is idempotent (single-table mode)
 
     Returns:
         LoadResult with statistics
     """
-    result = LoadResult(filename_to_table_name(filepath.name), filepath)
+    result = LoadResult(table_name or filename_to_table_name(filepath.name), filepath)
 
     # Detect encoding and delimiter
     result.encoding = detect_encoding(filepath)
@@ -333,13 +369,20 @@ def load_csv_to_db(
         )
 
     # Infer schema
-    column_names, column_types = infer_schema(
+    file_columns, column_types = infer_schema(
         filepath, result.encoding, result.delimiter
     )
 
-    if not column_names:
+    if not file_columns:
         logger.warning(f"No columns found in {filepath.name}, skipping")
         return result
+
+    # Optionally add the injected year column to the schema
+    insert_columns = list(file_columns)
+    if year_column:
+        column_types = dict(column_types)
+        column_types[year_column] = "INTEGER"
+        insert_columns.append(year_column)
 
     result.columns = column_types
 
@@ -357,6 +400,13 @@ def load_csv_to_db(
     db.begin_transaction()
 
     try:
+        # Idempotency for single-table mode: clear this year's rows first
+        if replace_year and year_column and year is not None:
+            db.conn.execute(
+                f'DELETE FROM "{result.table_name}" WHERE "{year_column}" = ?',
+                (year,),
+            )
+
         with open(filepath, "r", encoding=result.encoding, errors="replace", newline="") as f:
             reader = csv.reader(f, delimiter=result.delimiter)
 
@@ -374,12 +424,12 @@ def load_csv_to_db(
                     continue
 
                 # Handle row length mismatch
-                if len(row) != len(column_names):
+                if len(row) != len(file_columns):
                     malformed_count += 1
                     if malformed_count <= MALFORMED_ROW_WARN_LIMIT:
                         logger.warning(
                             f"Row {row_idx} in {filepath.name} has "
-                            f"{len(row)} columns, expected {len(column_names)}. "
+                            f"{len(row)} columns, expected {len(file_columns)}. "
                             f"Skipping."
                         )
                     result.rows_skipped += 1
@@ -388,14 +438,16 @@ def load_csv_to_db(
                 # Convert values
                 converted = tuple(
                     convert_value(row[i], column_types[name])
-                    for i, name in enumerate(column_names)
+                    for i, name in enumerate(file_columns)
                 )
+                if year_column:
+                    converted = converted + (year,)
 
                 batch.append(converted)
 
                 # Insert in batches
                 if len(batch) >= CHUNK_SIZE:
-                    db.insert_rows(result.table_name, column_names, batch)
+                    db.insert_rows(result.table_name, insert_columns, batch)
                     result.rows_loaded += len(batch)
                     batch = []
 
@@ -406,7 +458,7 @@ def load_csv_to_db(
 
             # Insert remaining batch
             if batch:
-                db.insert_rows(result.table_name, column_names, batch)
+                db.insert_rows(result.table_name, insert_columns, batch)
                 result.rows_loaded += len(batch)
 
         # Commit the transaction for this file
@@ -418,10 +470,15 @@ def load_csv_to_db(
         logger.error(f"Error loading {filepath.name}: {e}")
         raise
 
-    # Create indexes if requested
+    # Create indexes if requested. Besides generic *_id columns, index the
+    # shared participant id (NPR/KPR use "lopenr"; KUHR uses
+    # "pasientlopenummer") and the year column ("aar") used for filtering.
     if create_indexes:
-        for name in column_names:
-            if name.endswith("_id") or name == "pasientid":
+        for name in insert_columns:
+            if (
+                name.endswith("_id")
+                or name in ("pasientid", "pasientlopenummer", "lopenr", "aar")
+            ):
                 db.create_index(result.table_name, name)
 
     if malformed_count > MALFORMED_ROW_WARN_LIMIT:
@@ -432,7 +489,7 @@ def load_csv_to_db(
 
     logger.info(
         f"Loaded {result.table_name}: {result.rows_loaded} rows, "
-        f"{result.rows_skipped} skipped, {len(column_names)} columns"
+        f"{result.rows_skipped} skipped, {len(insert_columns)} columns"
     )
 
     return result
@@ -445,26 +502,59 @@ def load_all_csvs(
     verbose: bool = False,
     create_indexes: bool = False,
     tables_filter: Optional[List[str]] = None,
+    dataset_cfg: Optional[dict] = None,
 ) -> List[LoadResult]:
-    """Load all CSV files from a directory into the database."""
-    files = discover_csv_files(data_dir)
+    """Load all raw files from a directory into the database.
+
+    ``dataset_cfg`` (optional) is a DATASETS entry; it controls the file glob
+    used for discovery and the table-naming scheme. When it sets
+    ``single_table``, every file is loaded into one fixed table with the
+    delivery year injected into ``year_column``.
+    """
+    cfg = dataset_cfg or {}
+    file_glob = cfg.get("file_glob", DEFAULT_FILE_GLOB)
+    files = discover_csv_files(data_dir, file_glob)
     results: List[LoadResult] = []
 
+    single_table = bool(cfg.get("single_table"))
+    year_column = cfg.get("year_column") if single_table else None
+
+    # In single-table mode, drop the shared table once up front so --force
+    # rebuilds it cleanly (rather than dropping it per file).
+    if single_table and force and files:
+        shared_table = table_name_for(files[0].name, cfg)
+        if db.table_exists(shared_table):
+            db.drop_table(shared_table)
+
     for filepath in files:
-        table_name = filename_to_table_name(filepath.name)
+        table_name = table_name_for(filepath.name, cfg)
 
         # Apply table filter if specified
         if tables_filter and table_name not in tables_filter:
             logger.debug(f"Skipping {table_name} (not in filter)")
             continue
 
+        year: Optional[int] = None
+        if year_column:
+            year_str = extract_year(filepath.name)
+            if year_str is None:
+                logger.warning(
+                    f"Could not infer a year from {filepath.name}; skipping"
+                )
+                continue
+            year = int(year_str)
+
         try:
             result = load_csv_to_db(
                 filepath,
                 db,
-                force=force,
+                force=force and not single_table,
                 verbose=verbose,
                 create_indexes=create_indexes,
+                table_name=table_name,
+                year=year,
+                year_column=year_column,
+                replace_year=single_table,
             )
             results.append(result)
         except Exception as e:
