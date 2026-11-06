@@ -1,9 +1,10 @@
-# pheno2sqlite - NPR, KPR & KUHR CSV to SQLite Database Loaders
+# mobapheno2sqlite - MoBa Study NPR, KPR & KUHR CSV to SQLite Database Loaders
 
 Load Norwegian Patient Register (NPR), Kontroll og utbetaling av helserefusjoner (KPR/KUHR) and similar CSV files into separate on-disk SQLite databases for querying.
 This tool is not aimed at replacing other tools for handling MoBa study phenotyping information such as phenotools (https://github.com/psychgen/phenotools),
 but to serve as a way to make flexible SQL database style quires within single or across multiple datasources (e.g., KPR, KUHR, LMR, MBR, NPR, SSB, mobaQ).
 The current implementation has been developed and tested on NPR, KPR and KUHR data.
+It also does not filter out withdrawn participants who should not be used for analyses.
 
 ## Overview
 
@@ -24,7 +25,7 @@ Each database can be queried independently using standard SQL, `pandas`, or R, e
 ### Prerequisites
 
 - **Python 3.9+** with `pip` installed
-- Access to the raw NPR CSV files (placed in `raw/npr/2026-10-19/rawdata/`)
+- Access to the raw NPR/KPR/KUHR CSV files (placed in `raw/<registry>/<date>/rawdata/`). A script to symlink source directories is `link_phenodirs.sh` and is provided to symlink the phenotype directories into `raw/`. Modify it as needed.
 
 ### Setup
 
@@ -33,7 +34,7 @@ Clone the repository and install dependencies:
 ```bash
 # Clone the repository
 git clone <repository-url>
-cd pheno2sqlite
+cd mobapheno2sqlite
 
 # (Recommended) Create and activate a virtual environment
 python -m venv .venv
@@ -41,6 +42,15 @@ source .venv/bin/activate   # On Windows: .venv\Scripts\activate
 
 # Install required dependencies using pyproject.toml file
 pip install .
+
+# link registry information in TSD p697
+bash link_phenodirs.sh
+```
+
+On specific infrastructure such as TSD hosted by USIT at University of Oslo, you may want to preload specific software modules before creating the virtual environment:
+
+```bash
+module load Python/3.12.3-GCCcore-13.3.0 SciPy-bundle/2024.05-gfbf-2024a
 ```
 
 
@@ -50,9 +60,10 @@ The project requires the following Python packages:
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `pandas` | >= 1.3.0 | CSV parsing and data manipulation |
+| `pandas` | >= 2.0.0 | CSV parsing and data manipulation |
 | `numpy` | >= 1.21.0 | Numerical operations |
 | `pytest` | >= 7.0.0 | Testing (development only) |
+| `pytest-cov` | >= 4.0 | Testing (development only) |
 
 Only the standard library `sqlite3` module is used for database access - no additional database driver is needed.
 
@@ -618,7 +629,212 @@ FROM phvkoder k JOIN phvaktivitet a ON k.lopenr = a.lopenr AND k.nokkel = a.nokk
 WHERE k.kodenavn = 'ICD-10' AND (k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%');
 ```
 
-### 3. All diagnoses and corresponding timepoints for a given participant
+### 3. Alzheimer's dementia across primary and specialist care (KPR/KUHR ICPC-2 `P70` + NPR ICD-10 `G30`/`F00`)
+
+A broader Alzheimer's definition also captures contacts in **primary care**, where diagnoses are recorded as **ICPC-2** codes rather than ICD-10:
+
+| Source | Database | Table(s) | Code column | Code system | Code |
+|--------|----------|----------|-------------|-------------|------|
+| **KPR** | `db/kpr.db` | `diagnose` (+ `regning` for `aar`) | `diagnosekode` | `diagnosetabell = 'ICPC-2'` | `P70%` |
+| **KUHR** | `db/kuhr.db` | `kuhr` | `diagnoser` | `diagnosekodeverk = 'ICPC-2'` | `P70%` |
+| **NPR** | `db/npr.db` | `*koder` (+ `*aktivitet` for `aar`) | `kodeverdi` | `kodenavn = 'ICD-10'` | `G30%`, `F00%` |
+
+`P70` is *Dementia* (including Alzheimer's dementia) in ICPC-2; the `%` wildcard picks up all subcodes (`P700`, `P700000`, `P704`, …).
+
+Two schema details matter:
+
+- **KUHR's `diagnoser` is a comma-separated list** of up to several ICPC-2 codes per claim (`'P70, K86, T90'`), not a single code. A plain `LIKE 'P70%'` therefore misses `P70` when it is not the first code, so match both the start of the string and the post-comma position: `diagnoser LIKE 'P70%' OR diagnoser LIKE '%, P70%'`.
+- **KPR's `diagnosekode` is one code per row**, joined to `regning` on `(lopenr, nokkel)` to obtain the claim year `aar`.
+
+#### 3a. Union - any participant with Alzheimer's in *either* care level
+
+```sql
+ATTACH DATABASE 'file:db/kpr.db?mode=ro' AS kpr;
+ATTACH DATABASE 'file:db/kuhr.db?mode=ro' AS kuhr;
+
+WITH primary_care AS (
+    -- KPR: one ICPC-2 code per row ('P70', 'P700', 'P704', ...)
+    SELECT d.lopenr AS participant_id, 'KPR' AS source, r.aar AS year,
+           d.diagnosekode AS code
+    FROM kpr.diagnose d
+    JOIN kpr.regning  r ON r.lopenr = d.lopenr AND r.nokkel = d.nokkel
+    WHERE d.diagnosetabell LIKE 'ICPC-2%'
+      AND d.diagnosekode   LIKE 'P70%'
+
+    UNION ALL
+
+    -- KUHR: 'diagnoser' is a comma-separated list ('P70, K86, T90')
+    SELECT pasientlopenummer, 'KUHR', aar, diagnoser
+    FROM kuhr.kuhr
+    WHERE diagnosekodeverk LIKE 'ICPC-2%'
+      AND (diagnoser LIKE 'P70%' OR diagnoser LIKE '%, P70%')
+),
+specialist_care AS (
+    SELECT k.lopenr AS participant_id, 'NPR-som' AS domain,
+           a.aar AS year, k.kodeverdi AS code
+    FROM main.somkoder k
+    JOIN main.somaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+    WHERE k.kodenavn = 'ICD-10'
+      AND (k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%')
+
+    UNION ALL
+    SELECT k.lopenr, 'NPR-phv', a.aar, k.kodeverdi
+    FROM main.phvkoder k
+    JOIN main.phvaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+    WHERE k.kodenavn = 'ICD-10'
+      AND (k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%')
+
+    UNION ALL
+    SELECT k.lopenr, 'NPR-avt', a.aar, k.kodeverdi
+    FROM main.avtkoder k
+    JOIN main.avtaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+    WHERE k.kodenavn = 'ICD-10'
+      AND (k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%')
+
+    UNION ALL
+    SELECT k.lopenr, 'NPR-reh', a.aar, k.kodeverdi
+    FROM main.rehkoder k
+    JOIN main.rehaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+    WHERE k.kodenavn = 'ICD-10'
+      AND (k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%')
+
+    UNION ALL
+    SELECT k.lopenr, 'NPR-tsb', a.aar, k.kodeverdi
+    FROM main.tsbkoder k
+    JOIN main.tsbaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+    WHERE k.kodenavn = 'ICD-10'
+      AND (k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%')
+
+    UNION ALL
+    -- PHBU has no kodenavn column: all codes are ICD-10
+    SELECT k.lopenr, 'NPR-phbu', a.aar, k.kodeverdi
+    FROM main.phbukoder k
+    JOIN main.phbuaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+    WHERE k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%'
+)
+SELECT participant_id,
+       MIN(year) AS first_year,
+       MAX(year) AS last_year,
+       GROUP_CONCAT(DISTINCT source) AS primary_care_sources,
+       GROUP_CONCAT(DISTINCT domain) AS specialist_care_domains
+FROM (
+    SELECT participant_id, year, source, NULL AS domain FROM primary_care
+    UNION ALL
+    SELECT participant_id, year, NULL, domain FROM specialist_care
+)
+GROUP BY participant_id
+ORDER BY participant_id;
+```
+
+Each participant appears once; `primary_care_sources` / `specialist_care_domains` are `NULL` when the participant was found in only one care level, which makes it easy to see *where* the Alzheimer's code came from.
+
+#### 3b. Intersection - participants confirmed in *both* care levels
+
+Primary-care `P70` plus a specialist-care `G30`/`F00` confirmation (a stricter, better-supported Alzheimer's phenotype):
+
+```sql
+ATTACH DATABASE 'file:db/kpr.db?mode=ro'  AS kpr;
+ATTACH DATABASE 'file:db/kuhr.db?mode=ro' AS kuhr;
+
+CREATE TEMP TABLE pc_p70 AS
+SELECT d.lopenr AS participant_id, 'KPR' AS source, r.aar AS year
+FROM kpr.diagnose d
+JOIN kpr.regning r ON r.lopenr = d.lopenr AND r.nokkel = d.nokkel
+WHERE d.diagnosetabell LIKE 'ICPC-2%' AND d.diagnosekode LIKE 'P70%'
+UNION ALL
+SELECT pasientlopenummer, 'KUHR', aar
+FROM kuhr.kuhr
+WHERE diagnosekodeverk LIKE 'ICPC-2%'
+  AND (diagnoser LIKE 'P70%' OR diagnoser LIKE '%, P70%');
+
+CREATE TEMP TABLE npr_ad AS
+SELECT k.lopenr AS participant_id, 'NPR-som' AS domain, a.aar AS year
+FROM main.somkoder k
+JOIN main.somaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+WHERE k.kodenavn = 'ICD-10'
+  AND (k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%')
+UNION ALL
+SELECT k.lopenr, 'NPR-phv', a.aar
+FROM main.phvkoder k
+JOIN main.phvaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+WHERE k.kodenavn = 'ICD-10'
+  AND (k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%')
+UNION ALL
+SELECT k.lopenr, 'NPR-avt', a.aar
+FROM main.avtkoder k
+JOIN main.avtaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+WHERE k.kodenavn = 'ICD-10'
+  AND (k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%')
+UNION ALL
+SELECT k.lopenr, 'NPR-reh', a.aar
+FROM main.rehkoder k
+JOIN main.rehaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+WHERE k.kodenavn = 'ICD-10'
+  AND (k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%')
+UNION ALL
+SELECT k.lopenr, 'NPR-tsb', a.aar
+FROM main.tsbkoder k
+JOIN main.tsbaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+WHERE k.kodenavn = 'ICD-10'
+  AND (k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%')
+UNION ALL
+SELECT k.lopenr, 'NPR-phbu', a.aar
+FROM main.phbukoder k
+JOIN main.phbuaktivitet a ON a.lopenr = k.lopenr AND a.nokkel = k.nokkel
+WHERE k.kodeverdi LIKE 'G30%' OR k.kodeverdi LIKE 'F00%';
+
+-- Temp indexes make the cross-source joins fast
+CREATE INDEX temp.idx_pc_p70 ON pc_p70(participant_id);
+CREATE INDEX temp.idx_npr_ad ON npr_ad(participant_id);
+
+SELECT p.participant_id,
+       MIN(p.year) AS first_primary_care_year,
+       MAX(p.year) AS last_primary_care_year,
+       MIN(n.year) AS first_specialist_year,
+       MAX(n.year) AS last_specialist_year,
+       GROUP_CONCAT(DISTINCT p.source) AS primary_care_sources,
+       GROUP_CONCAT(DISTINCT n.domain) AS specialist_care_domains
+FROM pc_p70 p
+JOIN npr_ad n ON n.participant_id = p.participant_id
+GROUP BY p.participant_id
+ORDER BY p.participant_id;
+```
+
+#### 3c. Summary counts for the three definitions
+
+Run this in the **same session** as 3b - it re-uses the `pc_p70` and `npr_ad` temp tables, so the databases are already attached (re-running `ATTACH` would fail with `database kpr is already in use`):
+
+```sql
+SELECT 'primary care P70 only' AS criterion,
+       COUNT(DISTINCT participant_id) AS n_participants FROM pc_p70
+UNION ALL
+SELECT 'specialist care G30/F00 only', COUNT(DISTINCT participant_id) FROM npr_ad
+UNION ALL
+SELECT 'both (intersection)', COUNT(*) FROM (
+    SELECT DISTINCT participant_id FROM pc_p70
+    INTERSECT
+    SELECT DISTINCT participant_id FROM npr_ad
+)
+UNION ALL
+SELECT 'either (union)', COUNT(DISTINCT participant_id) FROM (
+    SELECT participant_id FROM pc_p70
+    UNION
+    SELECT participant_id FROM npr_ad
+);
+```
+
+> **Note:** the `%` wildcard is deliberate - `G30%`/`F00%` cover all ICD-10 subcodes (`G300`, `G309`, `F000`, `F001`, …) and `P70%` covers the ICPC-2 subcodes (`P700`, `P700000`, `P704`, …). If you need the exact code *and* its subcodes only, use `kodeverdi IN ('G30','F00') OR kodeverdi LIKE 'G30_%' OR kodeverdi LIKE 'F00_%'` instead. Also note that `diagnoser` in KUHR may contain trailing/leading spaces, so `TRIM()` the individual codes if you split the list yourself.
+
+> **Performance:** the cross-source joins are the slow part (roughly a minute on the full delivery). Run the loaders with `--create-indexes` first, and keep the temp tables + temp indexes shown in 3b rather than joining the raw tables repeatedly.
+
+The same query can be run without leaving the shell via the bundled helper (which ATTACHes the other sources read-only automatically):
+
+```bash
+python src/query.py "SELECT COUNT(DISTINCT d.lopenr) FROM kpr.diagnose d WHERE d.diagnosekode LIKE 'P70%'"
+python src/query.py "SELECT COUNT(DISTINCT pasientlopenummer) FROM kuhr.kuhr WHERE diagnosekodeverk LIKE 'ICPC-2%' AND (diagnoser LIKE 'P70%' OR diagnoser LIKE '%, P70%')"
+```
+
+### 4. All diagnoses and corresponding timepoints for a given participant
 
 For a specific participant (replace `'Fm000000'` with the actual `lopenr`):
 
@@ -663,7 +879,7 @@ WHERE a.lopenr = 'Fm000000' AND k.kodenavn = 'ICD-10'
 ORDER BY domain, year;
 ```
 
-### 4. Additional useful queries
+### 5. Additional useful queries
 
 #### Count records per year per domain
 

@@ -1,7 +1,9 @@
 #!/bin/bash
-# link different phenotype sources to "raw" directory
+# link different phenotype sources to local "raw" directory
 
 PHENODIR=/ess/p697/data/durable/phenotypes
+RAWDIR=raw
+mkdir -p $RAWDIR
 ln -s $PHENODIR/kpr/2026-10-19 raw/kpr/2026-10-19
 ln -s $PHENODIR/kuhr/2023-10-23/ raw/kuhr/2023-10-23
 # ln -s $PHENODIR/lmr/20XX raw/lmr
